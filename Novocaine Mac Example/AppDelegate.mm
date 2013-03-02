@@ -26,25 +26,25 @@ struct Osc {
     float phase = 0;
 };
 
-static inline float freqFromNote(int note) {
-    return 440.0 * pow(2,((double)note-69.0)/12.0);
+static inline float freqFromNote(double note) {
+    return 440 * pow(2,(note-69)/12);
 }
 
 Osc o1, o2, o3;
+
 NSMutableArray *currentlyPlayingNotesInOrder = [NSMutableArray array];
 NSMutableSet *currentlyPlayingNotes = [NSMutableSet set];
 
-//    currentlyPlayingNotes = [[NSMutableSet init] alloc];
-//    currentlyPlayingNotesInOrder = [[NSMutableArray init] alloc];
-
+float detune = 0;
+float subOscillator = -12;
 
 void playNote(int note) {
     Novocaine *audioManager = [Novocaine audioManager];
     o1.freq = freqFromNote(note);
-    o2.freq = o1.freq + 1;
-    o3.freq = freqFromNote(note - 12);
-    
+    o2.freq = freqFromNote(note + detune);
+    o3.freq = freqFromNote(note + subOscillator);
     [audioManager setOutputBlock:^(float *data, UInt32 numFrames, UInt32 numChannels)  {
+        o2.freq = freqFromNote(note + detune);
         float samplingRate = audioManager.samplingRate;
         for (int i=0; i < numFrames; ++i) {
             float theta = (sawOsc(o1.phase) + sawOsc(o2.phase) + sawOsc(o3.phase)) / 3;
@@ -80,7 +80,31 @@ void midiInputCallback (const MIDIPacketList *packetList, void *procRef, void *s
     int velocity = packet->data[2];
     
     NSNumber *noteNumber = [NSNumber numberWithInt:note];
-    //NSLog(@"%3i %3i %3i", message, note, velocity);
+    
+    switch (message & 0xF0) {
+        case 0x80: // note off
+            [currentlyPlayingNotes removeObject:noteNumber];
+            
+            // ta bort senaste noterna om de inte spelas längre
+            while ([currentlyPlayingNotesInOrder count] > 0 && ![currentlyPlayingNotes containsObject:[currentlyPlayingNotesInOrder lastObject]])
+                [currentlyPlayingNotesInOrder removeLastObject];
+            
+            if ([currentlyPlayingNotesInOrder count] > 0)
+                playNote((int)[[currentlyPlayingNotesInOrder lastObject] integerValue]);
+            else
+                silence();
+            break;
+        case 0x90: // note on
+            [currentlyPlayingNotesInOrder addObject:noteNumber];
+            [currentlyPlayingNotes addObject:noteNumber];
+            playNote(note);
+            break;
+        case 0xB0: // control change
+            detune = (velocity - 64) / 64.0;
+            break;
+        default:
+            NSLog(@"%3d %3d %3d", message, note, velocity);
+    }
     
     if (message >= 128 && message <= 143) { // note off
         [currentlyPlayingNotes removeObject:noteNumber];
@@ -135,10 +159,9 @@ void midiInputCallback (const MIDIPacketList *packetList, void *procRef, void *s
     ItemCount numOfDevices = MIDIGetNumberOfDevices();
     
     for (int i = 0; i < numOfDevices; i++) {
-        MIDIDeviceRef midiDevice = MIDIGetDevice(i);
         NSDictionary *midiProperties;
         
-        MIDIObjectGetProperties(midiDevice, (CFPropertyListRef *)&midiProperties, YES);
+        MIDIObjectGetProperties(MIDIGetDevice(i), (CFPropertyListRef *)&midiProperties, YES);
         MIDIEndpointRef src = MIDIGetSource(i);
         MIDIPortConnectSource(inputPort, src, NULL);
     }

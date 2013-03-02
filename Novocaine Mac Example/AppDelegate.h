@@ -23,15 +23,9 @@
 
 #import <Cocoa/Cocoa.h>
 #import "Novocaine.h"
-#import "RingBuffer.h"
-#import "AudioFileReader.h"
-#import "AudioFileWriter.h"
 
 @interface AppDelegate : NSObject <NSApplicationDelegate>
 {
-    @private
-//    NSMutableArray *currentlyPlayingNotesInOrder;
-//    NSMutableSet *currentlyPlayingNotes;
 }
 
 @property (assign) IBOutlet NSWindow *window;
