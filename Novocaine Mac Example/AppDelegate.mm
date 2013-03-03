@@ -9,79 +9,92 @@
     [super dealloc];
 }
 
-float sineOsc(float phase){
+static inline double sineOsc(double phase){
     return sin(phase * M_PI * 2);
 }
 
-float squareOsc(float phase){
+static inline double squareOsc(double phase){
     return signbit(phase);
 }
 
-float sawOsc(float phase){
+static inline double sawOsc(double phase){
     return phase;
 }
 
+typedef double (*oscFunction)(double);
+
 struct Osc {
-    float freq;
-    float phase = 0;
+    double amp = 1;
+    double freq = 440;
+    double phase = 0;
+    oscFunction function = &sawOsc;
 };
 
 static inline float freqFromNote(double note) {
     return 440 * pow(2,(note-69)/12);
 }
 
-Osc o1, o2, o3;
+Osc o1, o2, sub;
 
 NSMutableArray *currentlyPlayingNotesInOrder = [NSMutableArray array];
 NSMutableSet *currentlyPlayingNotes = [NSMutableSet set];
 
+float pitchBend = 0;
 float detune = 0;
-float subOscillator = -12;
+float subOscillatorOctavesBelow = 1;
+float note;
 
-void playNote(int note) {
-    Novocaine *audioManager = [Novocaine audioManager];
-    o1.freq = freqFromNote(note);
-    o2.freq = freqFromNote(note + detune);
-    o3.freq = freqFromNote(note + subOscillator);
-    [audioManager setOutputBlock:^(float *data, UInt32 numFrames, UInt32 numChannels)  {
-        o2.freq = freqFromNote(note + detune);
-        float samplingRate = audioManager.samplingRate;
+inline void updateFreqs() {
+    double notePitched = note + pitchBend;
+    o1.freq = freqFromNote(notePitched);
+    o2.freq = freqFromNote(notePitched + detune);
+    sub.freq = freqFromNote(notePitched - 12 * subOscillatorOctavesBelow);
+}
+
+void play() {
+    [[Novocaine audioManager] setOutputBlock:^(float *data, UInt32 numFrames, UInt32 numChannels)  {
+        float samplingRate = [[Novocaine audioManager] samplingRate];
+        float sumAmp = o1.amp + o2.amp + sub.amp;
         for (int i=0; i < numFrames; ++i) {
-            float theta = (sawOsc(o1.phase) + sawOsc(o2.phase) + sawOsc(o3.phase)) / 3;
+            float theta = 0;
+            theta += o1.amp * (*o1.function)(o1.phase) / sumAmp;
+            theta += o2.amp * (*o2.function)(o2.phase) / sumAmp;
+            theta += sub.amp * (*sub.function)(sub.phase) / sumAmp;
             
             for (int iChannel = 0; iChannel < numChannels; ++iChannel)
                 data[i * numChannels + iChannel] = theta;
             
             o1.phase += 1.0 / (samplingRate / o1.freq);
             o2.phase += 1.0 / (samplingRate / o2.freq);
-            o3.phase += 1.0 / (samplingRate / o3.freq);
+            sub.phase += 1.0 / (samplingRate / sub.freq);
             
             if (o1.phase > 1.0) o1.phase = -1;
             if (o2.phase > 1.0) o2.phase = -1;
-            if (o3.phase > 1.0) o3.phase = -1;
+            if (sub.phase > 1.0) sub.phase = -1;
         }
     }];
 }
 
 void silence() {
-    Novocaine *audioManager = [Novocaine audioManager];
-    [audioManager setOutputBlock:^(float *data, UInt32 numFrames, UInt32 numChannels)  {
-        for (int i=0; i < numFrames; ++i)
-            for (int iChannel = 0; iChannel < numChannels; ++iChannel)
-                data[i*numChannels + iChannel] = 0;
+    [[Novocaine audioManager] setOutputBlock:^(float *data, UInt32 numFrames, UInt32 numChannels) {
+        memset(data, 0, numFrames * numChannels * sizeof(float));
     }];
 }
 
-void midiInputCallback (const MIDIPacketList *packetList, void *procRef, void *srcRef)
-{
+static inline unsigned short CombineBytes(unsigned char First, unsigned char Second) {
+    unsigned short combined = (unsigned short)Second;
+    combined <<= 7;
+    combined |= (unsigned short)First;
+    return combined;
+}
+
+void midiInputCallback (const MIDIPacketList *packetList, void *procRef, void *srcRef) {
     const MIDIPacket *packet = packetList->packet;
-    int message = packet->data[0];
-    int note = packet->data[1];
-    int velocity = packet->data[2];
+    int combined = CombineBytes(packet->data[1], packet->data[2]);
     
-    NSNumber *noteNumber = [NSNumber numberWithInt:note];
+    NSNumber *noteNumber = [NSNumber numberWithInt:packet->data[1]];
     
-    switch (message & 0xF0) {
+    switch (packet->data[0] & 0xF0) {
         case 0x80: // note off
             [currentlyPlayingNotes removeObject:noteNumber];
             
@@ -89,46 +102,45 @@ void midiInputCallback (const MIDIPacketList *packetList, void *procRef, void *s
             while ([currentlyPlayingNotesInOrder count] > 0 && ![currentlyPlayingNotes containsObject:[currentlyPlayingNotesInOrder lastObject]])
                 [currentlyPlayingNotesInOrder removeLastObject];
             
-            if ([currentlyPlayingNotesInOrder count] > 0)
-                playNote((int)[[currentlyPlayingNotesInOrder lastObject] integerValue]);
-            else
+            if ([currentlyPlayingNotesInOrder count] > 0) {
+                note = (int)[[currentlyPlayingNotesInOrder lastObject] integerValue];
+                updateFreqs();
+            } else {
                 silence();
+            }
             break;
         case 0x90: // note on
             [currentlyPlayingNotesInOrder addObject:noteNumber];
             [currentlyPlayingNotes addObject:noteNumber];
-            playNote(note);
+            note = packet->data[1];
+            updateFreqs();
+            play();
             break;
         case 0xB0: // control change
-            detune = (velocity - 64) / 64.0;
+            detune = (packet->data[2] - 64) / 64.0;
+            updateFreqs();
+            //NSLog(@"detune: %f", detune);
+            break;
+        case 0xD0: // after touch, 2nd oscillator amplification
+            o2.amp = MIN(packet->data[1] / 64.0, 1);
+            NSLog(@"after touch: %d = %f", packet->data[1], o2.amp);
+            break;
+        case 0xE0: // pitch bend
+            pitchBend = combined / (double) 0x1FFF - 1;
+            updateFreqs();
+            break;
+        case 0xF0: // sys stuff, ignore
             break;
         default:
-            NSLog(@"%3d %3d %3d", message, note, velocity);
-    }
-    
-    if (message >= 128 && message <= 143) { // note off
-        [currentlyPlayingNotes removeObject:noteNumber];
-        
-        // ta bort senaste noterna om de inte spelas längre
-        while ([currentlyPlayingNotesInOrder count] > 0 && ![currentlyPlayingNotes containsObject:[currentlyPlayingNotesInOrder lastObject]]) {
-                [currentlyPlayingNotesInOrder removeLastObject];
-        }
-        
-        if ([currentlyPlayingNotesInOrder count] > 0) {
-            playNote([[currentlyPlayingNotesInOrder lastObject] integerValue]);
-        } else {
-            silence();
-        }
-    }
-    if (message >= 144 && message <= 159) { // note n
-        [currentlyPlayingNotesInOrder addObject:noteNumber];
-        [currentlyPlayingNotes addObject:noteNumber];
-        playNote(note);
+            //NSLog(@"%3d %3d %3d", message, note, velocity);
+            break;
     }
 }
 
-- (void)applicationDidFinishLaunching:(NSNotification *)aNotification
-{
+- (void)applicationDidFinishLaunching:(NSNotification *)aNotification {
+    sub.function = &sineOsc;
+    o2.amp = 0;
+    
     //set up midi input
     MIDIClientRef midiClient;
     MIDIEndpointRef src;
