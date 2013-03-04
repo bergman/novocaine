@@ -34,7 +34,7 @@ static inline float freqFromNote(double note) {
     return 440 * pow(2,(note-69)/12);
 }
 
-Osc o1, o2, sub;
+Osc o1, detunedOscillator, sub;
 
 NSMutableArray *currentlyPlayingNotesInOrder = [NSMutableArray array];
 NSMutableSet *currentlyPlayingNotes = [NSMutableSet set];
@@ -47,29 +47,29 @@ float note;
 inline void updateFreqs() {
     double notePitched = note + pitchBend;
     o1.freq = freqFromNote(notePitched);
-    o2.freq = freqFromNote(notePitched + detune);
+    detunedOscillator.freq = freqFromNote(notePitched + detune);
     sub.freq = freqFromNote(notePitched - 12 * subOscillatorOctavesBelow);
 }
 
 void play() {
     [[Novocaine audioManager] setOutputBlock:^(float *data, UInt32 numFrames, UInt32 numChannels)  {
         float samplingRate = [[Novocaine audioManager] samplingRate];
-        float sumAmp = o1.amp + o2.amp + sub.amp;
+        float sumAmp = o1.amp + detunedOscillator.amp + sub.amp;
         for (int i=0; i < numFrames; ++i) {
             float theta = 0;
             theta += o1.amp * (*o1.function)(o1.phase) / sumAmp;
-            theta += o2.amp * (*o2.function)(o2.phase) / sumAmp;
+            theta += detunedOscillator.amp * (*detunedOscillator.function)(detunedOscillator.phase) / sumAmp;
             theta += sub.amp * (*sub.function)(sub.phase) / sumAmp;
             
             for (int iChannel = 0; iChannel < numChannels; ++iChannel)
                 data[i * numChannels + iChannel] = theta;
             
             o1.phase += 1.0 / (samplingRate / o1.freq);
-            o2.phase += 1.0 / (samplingRate / o2.freq);
+            detunedOscillator.phase += 1.0 / (samplingRate / detunedOscillator.freq);
             sub.phase += 1.0 / (samplingRate / sub.freq);
             
             if (o1.phase > 1.0) o1.phase = -1;
-            if (o2.phase > 1.0) o2.phase = -1;
+            if (detunedOscillator.phase > 1.0) detunedOscillator.phase = -1;
             if (sub.phase > 1.0) sub.phase = -1;
         }
     }];
@@ -122,8 +122,8 @@ void midiInputCallback (const MIDIPacketList *packetList, void *procRef, void *s
             //NSLog(@"detune: %f", detune);
             break;
         case 0xD0: // after touch, 2nd oscillator amplification
-            o2.amp = MIN(packet->data[1] / 64.0, 1);
-            NSLog(@"after touch: %d = %f", packet->data[1], o2.amp);
+            detunedOscillator.amp = MIN(packet->data[1] / 64.0, 1);
+            NSLog(@"after touch: %d = %f", packet->data[1], detunedOscillator.amp);
             break;
         case 0xE0: // pitch bend
             pitchBend = combined / (double) 0x1FFF - 1;
@@ -139,7 +139,13 @@ void midiInputCallback (const MIDIPacketList *packetList, void *procRef, void *s
 
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification {
     sub.function = &sineOsc;
-    o2.amp = 0;
+    detunedOscillator.amp = 0;
+    
+//    detunedOscillator.amp = 1;
+//    detune = 0.1;
+//    note = 48;
+//    updateFreqs();
+//    play();
     
     //set up midi input
     MIDIClientRef midiClient;
