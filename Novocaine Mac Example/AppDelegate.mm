@@ -9,6 +9,8 @@
     [super dealloc];
 }
 
+#define freqFromNote(note) (440 * pow(2,(note-69)/12))
+
 static inline double sineOsc(double phase){
     return sin(phase * M_PI * 2);
 }
@@ -30,11 +32,9 @@ struct Osc {
     oscFunction function = &sawOsc;
 };
 
-static inline float freqFromNote(double note) {
-    return 440 * pow(2,(note-69)/12);
-}
-
-Osc o1, detunedOscillator, sub;
+Osc o1, o2, o3;
+#define NUM_OSCS 3
+Osc oscillators[NUM_OSCS] = {o1, o2, o3};
 
 NSMutableArray *currentlyPlayingNotesInOrder = [NSMutableArray array];
 NSMutableSet *currentlyPlayingNotes = [NSMutableSet set];
@@ -43,34 +43,63 @@ float pitchBend = 0;
 float detune = 0;
 float subOscillatorOctavesBelow = 1;
 float note;
+float amp = 1;
 
 inline void updateFreqs() {
     double notePitched = note + pitchBend;
-    o1.freq = freqFromNote(notePitched);
-    detunedOscillator.freq = freqFromNote(notePitched + detune);
-    sub.freq = freqFromNote(notePitched - 12 * subOscillatorOctavesBelow);
+    oscillators[0].freq = freqFromNote(notePitched);
+    oscillators[1].freq = freqFromNote(notePitched + detune);
+    oscillators[2].freq = freqFromNote(notePitched - 12 * subOscillatorOctavesBelow);
+}
+
+
+// http://www.musicdsp.org/showone.php?id=185
+// cutoff and resonance are from 0 to 127
+float cutoff = 0;
+float resonance = 0;
+float c = 0;
+float r = 0;
+float v0 = 0;
+float v1 = 0;
+float fval = 0;
+
+void updateFilter() {
+    c = pow(0.5, (128 - cutoff)   / 16.0);
+    r = pow(0.5, (resonance + 24) / 16.0);
+    fval = 1 - r * c;
+}
+
+float filter(float input) {
+    v0 = fval * v0 - c * v1 + c * input;
+    v1 = fval * v1 + c * v0;
+
+    return v1;
 }
 
 void play() {
+    float samplingRate = [[Novocaine audioManager] samplingRate];
     [[Novocaine audioManager] setOutputBlock:^(float *data, UInt32 numFrames, UInt32 numChannels)  {
-        float samplingRate = [[Novocaine audioManager] samplingRate];
-        float sumAmp = o1.amp + detunedOscillator.amp + sub.amp;
+        float sumAmp = 0;
+        for (int o = 0; o < NUM_OSCS; ++o)
+            sumAmp += oscillators[o].amp;
+
         for (int i=0; i < numFrames; ++i) {
             float theta = 0;
-            theta += o1.amp * (*o1.function)(o1.phase) / sumAmp;
-            theta += detunedOscillator.amp * (*detunedOscillator.function)(detunedOscillator.phase) / sumAmp;
-            theta += sub.amp * (*sub.function)(sub.phase) / sumAmp;
+            for (int o = 0; o < NUM_OSCS; ++o) {
+                theta += oscillators[o].amp * (*(oscillators[o].function))(oscillators[o].phase) / sumAmp;
+                oscillators[o].phase += 1.0 / (samplingRate / oscillators[o].freq);
+                if (oscillators[o].phase > 1.0)
+                    oscillators[o].phase = -1;
+            }
+            theta *= amp;
+            
+            theta = filter(theta);
+            
+            // TODO: try to use vDSP_vfill
+            //vDSP_vfill(&theta, data, 1, numChannels);
             
             for (int iChannel = 0; iChannel < numChannels; ++iChannel)
                 data[i * numChannels + iChannel] = theta;
-            
-            o1.phase += 1.0 / (samplingRate / o1.freq);
-            detunedOscillator.phase += 1.0 / (samplingRate / detunedOscillator.freq);
-            sub.phase += 1.0 / (samplingRate / sub.freq);
-            
-            if (o1.phase > 1.0) o1.phase = -1;
-            if (detunedOscillator.phase > 1.0) detunedOscillator.phase = -1;
-            if (sub.phase > 1.0) sub.phase = -1;
         }
     }];
 }
@@ -117,20 +146,30 @@ void midiInputCallback (const MIDIPacketList *packetList, void *procRef, void *s
             play();
             break;
         case 0xB0: // control change
-            detune = (packet->data[2] - 64) / 64.0;
-            updateFreqs();
-            //NSLog(@"detune: %f", detune);
+            // http://www.spectrasonics.net/products/legacy/atmosphere-cclist.php
+            switch (packet->data[1]) {
+                case 74:
+                    cutoff = packet->data[2];
+                    updateFilter();
+                    break;
+                case 71:
+                    resonance = packet->data[2];
+                    updateFilter();
+                    break;
+                default:
+                    detune = (packet->data[2] - 64) / 64.0;
+                    updateFreqs();
+            }
             break;
-        case 0xD0: // after touch, 2nd oscillator amplification
-            detunedOscillator.amp = MIN(packet->data[1] / 64.0, 1);
-            NSLog(@"after touch: %d = %f", packet->data[1], detunedOscillator.amp);
+        case 0xD0: // after touch
+            //detunedOscillator.amp = MIN(packet->data[1] / 64.0, 1);
+            NSLog(@"after touch: %d = %f", packet->data[1], o2.amp);
             break;
         case 0xE0: // pitch bend
             pitchBend = combined / (double) 0x1FFF - 1;
             updateFreqs();
             break;
         case 0xF0: // sys stuff, ignore
-            break;
         default:
             //NSLog(@"%3d %3d %3d", message, note, velocity);
             break;
@@ -138,50 +177,56 @@ void midiInputCallback (const MIDIPacketList *packetList, void *procRef, void *s
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification {
-    sub.function = &sineOsc;
-    detunedOscillator.amp = 0;
-    
-//    detunedOscillator.amp = 1;
-//    detune = 0.1;
-//    note = 48;
-//    updateFreqs();
-//    play();
-    
+    // filter init
+    cutoff = 127;
+    resonance = 0;
+    updateFilter();
+    oscillators[2].function = &sineOsc;
+    amp = 0.1;
+    detune = 0.01;
+//    // note = 48; // 48 = C3
+//    // http://www.phys.unsw.edu.au/jw/notes.html
+//    float notes[8] = {48, 50, 52, 53, 55, 57, 59, 60};
+//    int i = 0;
+//    while (true) {
+//        note = notes[i++ % 8];
+//        updateFreqs();
+//        play();
+//        usleep(600000);
+//        silence();
+//        usleep(300000);
+//    }
+
     //set up midi input
     MIDIClientRef midiClient;
     MIDIEndpointRef src;
-    
+
     OSStatus result;
-    
+
     result = MIDIClientCreate(CFSTR("MIDI client"), NULL, NULL, &midiClient);
     if (result != noErr) {
-        NSLog(@"Errore : %s - %s",
-              GetMacOSStatusErrorString(result),
-              GetMacOSStatusCommentString(result));
+        NSLog(@"Error: %s - %s", GetMacOSStatusErrorString(result), GetMacOSStatusCommentString(result));
         return;
     }
-    
+
     //note the use of "self" to send the reference to this document object
     result = MIDIDestinationCreate(midiClient, CFSTR("Porta virtuale"), midiInputCallback, self, &src);
     if (result != noErr ) {
-        NSLog(@"Errore : %s - %s",
-              GetMacOSStatusErrorString(result),
-              GetMacOSStatusCommentString(result));
+        NSLog(@"Error: %s - %s", GetMacOSStatusErrorString(result), GetMacOSStatusCommentString(result));
         return;
     }
-    
+
     MIDIPortRef inputPort;
     //and again here
     result = MIDIInputPortCreate(midiClient, CFSTR("Input"), midiInputCallback, self, &inputPort);
-    
+
     ItemCount numOfDevices = MIDIGetNumberOfDevices();
-    
+
     for (int i = 0; i < numOfDevices; i++) {
         NSDictionary *midiProperties;
-        
+
         MIDIObjectGetProperties(MIDIGetDevice(i), (CFPropertyListRef *)&midiProperties, YES);
-        MIDIEndpointRef src = MIDIGetSource(i);
-        MIDIPortConnectSource(inputPort, src, NULL);
+        MIDIPortConnectSource(inputPort, MIDIGetSource(i), NULL);
     }
 }
 
